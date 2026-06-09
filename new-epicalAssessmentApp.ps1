@@ -4,33 +4,123 @@ param(
     [string]$Description = "Read-only assessment application deployed by Epical for Entra governance review",
     [string]$TenantId = "delusionaldev.onmicrosoft.com",
     [string]$CertName = "Epical-Assessment-Cert",
-    [int]$CertValidityYears = 2
+    [int]$CertValidityYears = 2,
+    [switch]$SkipGraphConnect
 )
 
-# Requires: Microsoft.Graph.Authentication module only
-# Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
+$ErrorActionPreference = "Stop"
+
+# Requires: Microsoft.Graph.Authentication module
+
+function Ensure-Module {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    $available = Get-Module -ListAvailable -Name $Name
+    if (-not $available) {
+        Write-Host "Module '$Name' not found. Installing for current user..." -ForegroundColor Yellow
+        Install-Module -Name $Name -Scope CurrentUser -Repository PSGallery -AllowClobber -Force
+    }
+
+    Import-Module $Name -ErrorAction Stop
+}
+
+Write-Host "Checking required PowerShell modules..." -ForegroundColor Cyan
+$requiredModules = @(
+    "Microsoft.Graph.Authentication"
+)
+
+foreach ($moduleName in $requiredModules) {
+    Ensure-Module -Name $moduleName
+}
+
+$graphConnectedByScript = $false
+
+if (-not $SkipGraphConnect) {
+    $graphContext = Get-MgContext -ErrorAction SilentlyContinue
+    if ($null -eq $graphContext) {
+        Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
+        try {
+            Connect-MgGraph -TenantId $TenantId -Scopes "Application.ReadWrite.All"
+            $graphConnectedByScript = $true
+        } catch {
+            throw "Failed to connect to Microsoft Graph. $($_.Exception.Message)"
+        }
+    } else {
+        $currentTenant = $graphContext.TenantId
+        if (-not [string]::IsNullOrWhiteSpace($currentTenant) -and ($currentTenant -ne $TenantId)) {
+            Write-Host "Connected to tenant '$currentTenant', but script requires '$TenantId'. Reconnecting..." -ForegroundColor Yellow
+            Disconnect-MgGraph -ErrorAction SilentlyContinue
+            try {
+                Connect-MgGraph -TenantId $TenantId -Scopes "Application.ReadWrite.All"
+                $graphConnectedByScript = $true
+            } catch {
+                throw "Failed to reconnect to Microsoft Graph for tenant '$TenantId'. $($_.Exception.Message)"
+            }
+        } else {
+            Write-Host "Microsoft Graph is already connected as $($graphContext.Account) in tenant '$currentTenant'." -ForegroundColor Green
+        }
+    }
+}
 
 # ─────────────────────────────────────────────
 # 1. Generate a self-signed certificate
 # ─────────────────────────────────────────────
 Write-Host "Generating self-signed certificate..." -ForegroundColor Cyan
 
-$cert = New-SelfSignedCertificate `
-    -Subject "CN=$CertName" `
-    -CertStoreLocation "Cert:\CurrentUser\My" `
-    -KeyExportPolicy Exportable `
-    -KeySpec Signature `
-    -KeyLength 2048 `
-    -HashAlgorithm SHA256 `
-    -NotAfter (Get-Date).AddYears($CertValidityYears)
+if ([string]::IsNullOrWhiteSpace($env:TEMP)) {
+    $tempDir = [System.IO.Path]::GetTempPath()
+} else {
+    $tempDir = $env:TEMP
+}
 
-# Export the public key (.cer) so it can be uploaded to the app registration
-$certPath = "$env:TEMP\$CertName.cer"
-Export-Certificate -Cert $cert -FilePath $certPath | Out-Null
+$certPath = Join-Path $tempDir "$CertName.cer"
+$pfxPath = Join-Path $tempDir "$CertName.pfx"
+
+if (Get-Command New-SelfSignedCertificate -ErrorAction SilentlyContinue) {
+    # Windows PowerShell / Windows pwsh path
+    $cert = New-SelfSignedCertificate `
+        -Subject "CN=$CertName" `
+        -CertStoreLocation "Cert:\CurrentUser\My" `
+        -KeyExportPolicy Exportable `
+        -KeySpec Signature `
+        -KeyLength 2048 `
+        -HashAlgorithm SHA256 `
+        -NotAfter (Get-Date).AddYears($CertValidityYears)
+
+    Export-Certificate -Cert $cert -FilePath $certPath | Out-Null
+    $certBytes = [System.IO.File]::ReadAllBytes($certPath)
+} else {
+    # Cross-platform (macOS/Linux): create and export with .NET crypto APIs.
+    $rsa = [System.Security.Cryptography.RSA]::Create(2048)
+    $dn = [System.Security.Cryptography.X509Certificates.X500DistinguishedName]::new("CN=$CertName")
+    $req = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
+        $dn,
+        $rsa,
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+        [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
+    )
+
+    $notBefore = (Get-Date).AddMinutes(-5)
+    $notAfter = (Get-Date).AddYears($CertValidityYears)
+    $cert = $req.CreateSelfSigned($notBefore, $notAfter)
+
+    $certBytes = $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
+    [System.IO.File]::WriteAllBytes($certPath, $certBytes)
+
+    # Save a passwordless PFX copy for later client-auth usage if needed.
+    $pfxBytes = $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx)
+    [System.IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
+}
 
 # Encode the public key as Base64 for the Graph API call
-$certBytes = [System.IO.File]::ReadAllBytes($certPath)
 $certBase64 = [System.Convert]::ToBase64String($certBytes)
+
+if ([string]::IsNullOrWhiteSpace($certBase64)) {
+    throw "Certificate generation failed: public key payload is empty."
+}
 
 Write-Host "Certificate created. Thumbprint: $($cert.Thumbprint)" -ForegroundColor Green
 
@@ -75,7 +165,15 @@ $body = ConvertTo-Json -Depth 20 @{
     )
 }
 
-$app = Invoke-MgGraphRequest -Method POST -ContentType "application/json" -Body $body -Uri "https://graph.microsoft.com/beta/applications"
+try {
+    $app = Invoke-MgGraphRequest -Method POST -ContentType "application/json" -Body $body -Uri "https://graph.microsoft.com/beta/applications"
+} catch {
+    throw "Failed to create app registration in Microsoft Graph. $($_.Exception.Message)"
+}
+
+if ($null -eq $app -or [string]::IsNullOrWhiteSpace($app.appId)) {
+    throw "Graph returned an empty response for app creation."
+}
 
 Write-Host "App registration created. Application ID: $($app.appId)" -ForegroundColor Green
 
@@ -89,6 +187,7 @@ $results = [PSCustomObject]@{
     CertThumbprint = $cert.Thumbprint
     CertExpiry     = $cert.NotAfter.ToString("yyyy-MM-dd")
     CertPath       = $certPath
+    PfxPath        = if (Test-Path $pfxPath) { $pfxPath } else { $null }
     ConnectCommand = "Connect-MgGraph -ClientId '$($app.appId)' -TenantId '$TenantId' -CertificateThumbprint '$($cert.Thumbprint)'"
 }
 
@@ -101,3 +200,9 @@ Write-Host "3. Share the details below with Epical securely"
 Write-Host "─────────────────────────────────────────`n" -ForegroundColor Yellow
 
 $results | Format-List
+
+if ($graphConnectedByScript) {
+    Write-Host "Disconnecting from Microsoft Graph..." -ForegroundColor Cyan
+    Disconnect-MgGraph -ErrorAction SilentlyContinue |Out-Null
+    Write-Host "Disconnected from Microsoft Graph." -ForegroundColor Green
+}
